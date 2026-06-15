@@ -126,31 +126,24 @@ public class QuotaNotificationService {
                     threshold, userData.getUserName(), balance.getBucketId(),
                     oldUsagePercentage, newUsagePercentage);
 
-            // Check if this notification was already sent to prevent duplicates
-            return notificationTrackingService.isDuplicateNotification(
+            // Atomically claim the dedup slot (SETNX + TTL) so concurrent crossings can't both send.
+            return notificationTrackingService.tryAcquireNotificationSlot(
                     userData.getUserName(),
                     templateId,
                     balance.getBucketId(),
                     threshold
-            ).onItem().transformToUni(isDuplicate -> {
-                if (Boolean.TRUE.equals(isDuplicate)) {
+            ).onItem().transformToUni(acquired -> {
+                if (!Boolean.TRUE.equals(acquired)) {
                     LOG.infof("Skipping duplicate notification for user=%s, templateId=%d, bucket=%s, threshold=%d%%",
                             userData.getUserName(), templateId, balance.getBucketId(), threshold);
                     return Uni.createFrom().voidItem();
                 }
 
-                // Create and send notification
+                // Create and publish notification (slot already claimed atomically above)
                 ThresholdExpiryEvent event = createNotificationEvent(
                         userData, balance, template, templateId, newQuota
                 );
-
-                // Mark notification as sent and publish the event
-                return notificationTrackingService.markNotificationSent(
-                        userData.getUserName(),
-                        templateId,
-                        balance.getBucketId(),
-                        threshold
-                ).onItem().transformToUni(v -> accountProducer.produceQuotaNotificationEvent(event));
+                return accountProducer.produceQuotaNotificationEvent(event);
             });
         }
 
@@ -178,7 +171,7 @@ public class QuotaNotificationService {
         ThresholdExpiryEvent.Meta meta = new ThresholdExpiryEvent.Meta(
                 templateId.toString(),
                 "AAA",
-                "THREHOLD",
+                "THRESHOLD",
                 Instant.now(),
                 "FTTX"
         );

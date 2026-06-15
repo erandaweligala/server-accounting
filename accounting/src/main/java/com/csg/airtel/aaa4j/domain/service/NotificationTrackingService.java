@@ -1,6 +1,7 @@
 package com.csg.airtel.aaa4j.domain.service;
 
 import io.quarkus.redis.datasource.ReactiveRedisDataSource;
+import io.quarkus.redis.datasource.keys.ReactiveKeyCommands;
 import io.quarkus.redis.datasource.value.ReactiveValueCommands;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -19,10 +20,38 @@ public class NotificationTrackingService {
     private static final Duration DEFAULT_TTL = Duration.ofHours(1);
 
     private final ReactiveValueCommands<String, String> valueCommands;
+    private final ReactiveKeyCommands<String> keyCommands;
 
     @Inject
     public NotificationTrackingService(ReactiveRedisDataSource reactiveRedisDataSource) {
         this.valueCommands = reactiveRedisDataSource.value(String.class, String.class);
+        this.keyCommands = reactiveRedisDataSource.key();
+    }
+
+    /**
+     * Atomically claim the notification slot for (username, templateId, bucketId, threshold).
+     * Uses SETNX so only one concurrent caller wins the slot, then applies the dedup TTL.
+     *
+     * @return Uni&lt;Boolean&gt; true if this caller acquired the slot (i.e. NOT a duplicate, should send);
+     *         false if a notification was already recorded within the TTL window.
+     */
+    public Uni<Boolean> tryAcquireNotificationSlot(
+            String username,
+            Long templateId,
+            String bucketId,
+            Long thresholdLevel) {
+
+        String trackingKey = buildTrackingKey(username, templateId, bucketId, thresholdLevel);
+        String timestamp = String.valueOf(System.currentTimeMillis());
+
+        return valueCommands.setnx(trackingKey, timestamp)
+                .onItem().call(acquired -> Boolean.TRUE.equals(acquired)
+                        ? keyCommands.expire(trackingKey, DEFAULT_TTL.getSeconds()).replaceWithVoid()
+                        : Uni.createFrom().voidItem())
+                .onFailure().invoke(error ->
+                        LOG.warnf("Error acquiring notification slot for key %s: %s. Allowing notification to proceed.",
+                                trackingKey, error.getMessage()))
+                .onFailure().recoverWithItem(true); // fail-open: on error, allow the notification
     }
 
     /**
