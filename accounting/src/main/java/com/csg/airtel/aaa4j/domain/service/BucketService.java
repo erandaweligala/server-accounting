@@ -1,0 +1,675 @@
+package com.csg.airtel.aaa4j.domain.service;
+
+import com.csg.airtel.aaa4j.application.common.LoggingUtil;
+import com.csg.airtel.aaa4j.domain.model.coa.CoaDisconnectScenario;
+import com.csg.airtel.aaa4j.domain.model.response.ApiResponse;
+import com.csg.airtel.aaa4j.domain.model.session.Balance;
+import com.csg.airtel.aaa4j.domain.model.session.BalanceWrapper;
+import com.csg.airtel.aaa4j.domain.model.session.Session;
+import com.csg.airtel.aaa4j.domain.model.session.UserSessionData;
+import com.csg.airtel.aaa4j.external.clients.CacheClient;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.ws.rs.core.Response;
+import org.jboss.logging.Logger;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+
+
+@ApplicationScoped
+public class BucketService {
+    private static final Logger log = Logger.getLogger(BucketService.class);
+    private static final String M_ADD = "addBucketBalance";
+    private static final String M_UPDATE = "updateBucketBalance";
+    private static final String M_TERMINATE = "terminateSessions";
+    private static final String M_STATUS = "updateUserStatus";
+    private static final String M_SVC_STATUS = "updateServiceStatus";
+    private static final String M_DELETE_SVC = "deleteService";
+    public static final String USER_NOT_FOUND = "User not found";
+    public static final String USERNAME_IS_REQUIRED = "Username is required";
+    private final CacheClient cacheClient;
+    private final COAService  coaService;
+
+    public BucketService(CacheClient cacheClient, COAService coaService) {
+        this.cacheClient = cacheClient;
+        this.coaService = coaService;
+    }
+
+    /**
+     * Remove expired balances based on serviceExpiry or bucketExpiryDate.
+     * A balance is considered expired if either serviceExpiry or bucketExpiryDate is before the current time.
+     *
+     * @param balances list of balances to filter
+     * @return filtered list containing only non-expired balances
+     */
+    private List<Balance> removeExpiredBalances(List<Balance> balances) {
+        if (balances == null || balances.isEmpty()) {
+            return balances;
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        List<Balance> nonExpiredBalances = new ArrayList<>();
+
+        for (Balance balance : balances) {
+            boolean isExpired = false;
+
+            // Check serviceExpiry
+            if (balance.getServiceExpiry() != null && balance.getServiceExpiry().isBefore(now)) {
+                isExpired = true;
+                LoggingUtil.logInfo(log, "removeExpiredBalances", "Removing expired balance: bucketId=%s, serviceExpiry=%s",
+                        balance.getBucketId(), balance.getServiceExpiry());
+            }
+
+            // Check bucketExpiryDate
+            if (!isExpired && balance.getBucketExpiryDate() != null && balance.getBucketExpiryDate().isBefore(now)) {
+                isExpired = true;
+                LoggingUtil.logInfo(log, "removeExpiredBalances", "Removing expired balance: bucketId=%s, bucketExpiryDate=%s",
+                        balance.getBucketId(), balance.getBucketExpiryDate());
+            }
+
+            if (!isExpired) {
+                nonExpiredBalances.add(balance);
+            }
+        }
+
+        return nonExpiredBalances;
+    }
+
+    public Uni<ApiResponse<Balance>> addBucketBalance(String userName, BalanceWrapper balance) {
+        // Input validation
+        if (userName == null || userName.isBlank()) {
+            return Uni.createFrom().item(createErrorResponse(USERNAME_IS_REQUIRED));
+        }
+        if (balance == null || balance.getBalance() == null || balance.getBalance().isEmpty()) {
+            return Uni.createFrom().item(createErrorResponse("Balance is required"));
+        }
+
+        Balance singleBalance = balance.getBalance().get(0);
+
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        // Create new entry without session section, only with balance details
+                        LoggingUtil.logInfo(log, M_ADD, "User data not found for user %s, creating new entry with balance", userName);
+                        List<Balance> newBalances = new ArrayList<>();
+                        newBalances.add(singleBalance);
+                        String groupId = null;
+                        if (singleBalance.isGroup()) {
+                            groupId = singleBalance.getBucketUsername();
+                        }
+
+                        UserSessionData newUserData = UserSessionData.builder()
+                                .concurrency(balance.getConcurrency())
+                                .groupId(groupId)
+                                .userName(userName)
+                                .balance(Collections.unmodifiableList(newBalances))
+                                .sessions(Collections.emptyList())
+                                .build();
+
+                        return cacheClient.updateUserAndRelatedCaches(userName, newUserData, userName)
+                                .onItem().transform(result -> createSuccessResponse(singleBalance, "Bucket Added Successfully"));
+                    }
+
+                    // Existing user: create defensive copy with null-safe handling
+                    List<Balance> existingBalances = Objects.requireNonNullElse(userData.getBalance(), List.of());
+                    List<Balance> nonExpiredBalances = removeExpiredBalances(existingBalances);
+                    List<Balance> newBalances = new ArrayList<>(nonExpiredBalances);
+                    newBalances.add(singleBalance);
+
+                    UserSessionData updatedUserData = userData.toBuilder()
+                            .balance(Collections.unmodifiableList(newBalances))
+                            .build();
+
+                    // If new balance has higher priority (lower number) than any existing balance, send COA disconnect
+                    final boolean needsCOA = singleBalance.getPriority() != null &&
+                            nonExpiredBalances.stream()
+                                    .filter(b -> b.getPriority() != null)
+                                    .anyMatch(b -> singleBalance.getPriority() < b.getPriority());
+
+                    if (needsCOA) {
+                        LoggingUtil.logInfo(log, M_ADD, "New balance priority %d is higher than existing, triggering COA disconnect for user %s",
+                                singleBalance.getPriority(), userName);
+                    }
+
+                    return cacheClient.updateUserAndRelatedCaches(userName, updatedUserData, userName)
+                            .call(() -> needsCOA
+                                    ? coaService.clearAllSessionsAndSendCOA(updatedUserData, userName, null, CoaDisconnectScenario.BALANCE_PRIORITY_CHANGE)
+                                    : Uni.createFrom().item(updatedUserData))
+                            .onItem().transform(result -> createSuccessResponse(singleBalance, "Bucket Added Successfully"));
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_ADD, throwable, "Failed to add balance for user %s: %s",
+                            userName, throwable.getMessage());
+                    return createErrorResponse(
+                            "Failed to add balance: " + throwable.getMessage()
+                    );
+                });
+    }
+
+
+    public Uni<ApiResponse<List<Balance>>> addBucketListBalance(String userName, BalanceWrapper balanceWrapper) {
+        if (userName == null || userName.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseList(USERNAME_IS_REQUIRED));
+        }
+        if (balanceWrapper == null || balanceWrapper.getBalance() == null || balanceWrapper.getBalance().isEmpty()) {
+            return Uni.createFrom().item(createErrorResponseList("Balance list is required"));
+        }
+
+        List<Balance> newBalances = new ArrayList<>(balanceWrapper.getBalance().size());
+        for (Balance b : balanceWrapper.getBalance()) {
+            if (b != null) {
+                newBalances.add(b);
+            }
+        }
+
+        if (newBalances.isEmpty()) {
+            return Uni.createFrom().item(createErrorResponseList("No valid balances provided"));
+        }
+
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        LoggingUtil.logInfo(log, M_ADD, "User data not found for user %s, creating new entry with balance list", userName);
+                        String groupId = null;
+                        for (Balance b : newBalances) {
+                            if (b.isGroup() && b.getBucketUsername() != null) {
+                                groupId = b.getBucketUsername();
+                                break;
+                            }
+                        }
+
+                        UserSessionData newUserData = UserSessionData.builder()
+                                .concurrency(balanceWrapper.getConcurrency())
+                                .groupId(groupId)
+                                .userName(userName)
+                                .balance(Collections.unmodifiableList(newBalances))
+                                .sessions(Collections.emptyList())
+                                .build();
+
+                        return cacheClient.updateUserAndRelatedCaches(userName, newUserData, userName)
+                                .onItem().transform(result -> {
+                                    LoggingUtil.logInfo(log, M_ADD, "Bucket list added successfully for user %s, count: %d", userName, newBalances.size());
+                                    return createSuccessResponseList(newBalances, "Bucket List Added Successfully");
+                                });
+                    }
+
+                    List<Balance> existingBalances = Objects.requireNonNullElse(userData.getBalance(), List.of());
+                    List<Balance> nonExpiredBalances = removeExpiredBalances(existingBalances);
+                    List<Balance> combined = new ArrayList<>(nonExpiredBalances);
+                    combined.addAll(newBalances);
+
+                    UserSessionData updatedUserData = userData.toBuilder()
+                            .balance(Collections.unmodifiableList(combined))
+                            .build();
+
+                    // If any new balance has higher priority (lower number) than any existing balance, send COA disconnect
+                    final boolean needsCOA = newBalances.stream()
+                            .filter(nb -> nb.getPriority() != null)
+                            .anyMatch(nb -> nonExpiredBalances.stream()
+                                    .filter(eb -> eb.getPriority() != null)
+                                    .anyMatch(eb -> nb.getPriority() < eb.getPriority()));
+
+                    if (needsCOA) {
+                        LoggingUtil.logInfo(log, M_ADD, "New balance list contains higher priority balance, triggering COA disconnect for user %s", userName);
+                    }
+
+                    return cacheClient.updateUserAndRelatedCaches(userName, updatedUserData, userName)
+                            .call(() -> needsCOA
+                                    ? coaService.clearAllSessionsAndSendCOA(updatedUserData, userName, null, CoaDisconnectScenario.BALANCE_PRIORITY_CHANGE)
+                                    : Uni.createFrom().item(updatedUserData))
+                            .onItem().transform(result -> {
+                                LoggingUtil.logInfo(log, M_ADD, "Bucket list added successfully for user %s, count: %d", userName, newBalances.size());
+                                return createSuccessResponseList(newBalances, "Bucket List Added Successfully");
+                            });
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_ADD, throwable, "Failed to add balance list for user %s: %s",
+                            userName, throwable.getMessage());
+                    return createErrorResponseList("Failed to add balance list: " + throwable.getMessage());
+                });
+    }
+
+    private ApiResponse<List<Balance>> createSuccessResponseList(List<Balance> balances, String message) {
+        ApiResponse<List<Balance>> response = new ApiResponse<>();
+        response.setTimestamp(Instant.now());
+        response.setMessage(message);
+        response.setStatus(Response.Status.OK);
+        response.setData(balances);
+        return response;
+    }
+
+    private ApiResponse<List<Balance>> createErrorResponseList(String message) {
+        ApiResponse<List<Balance>> response = new ApiResponse<>();
+        response.setTimestamp(Instant.now());
+        response.setMessage(message);
+        response.setData(null);
+        response.setStatus(Response.Status.BAD_REQUEST);
+        return response;
+    }
+
+    public Uni<ApiResponse<Balance>> updateBucketBalance(String userName, Balance balance, String serviceId) {
+        LoggingUtil.logInfo(log, M_UPDATE, "Updating bucket Balance for user %s", userName);
+        // Input validation
+        if (userName == null || userName.isBlank()) {
+            return Uni.createFrom().item(createErrorResponse(USERNAME_IS_REQUIRED));
+        }
+        if (balance == null) {
+            return Uni.createFrom().item(createErrorResponse("Balance is required"));
+        }
+        if (serviceId == null || serviceId.isBlank()) {
+            return Uni.createFrom().item(createErrorResponse("Service Id is required"));
+        }
+
+        if (balance.getServiceId() == null || !balance.getServiceId().equals(serviceId)) {
+            return Uni.createFrom().item(createErrorResponse("Balance serviceId must match the provided serviceId"));
+        }
+
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        return Uni.createFrom().item(createErrorResponse(USER_NOT_FOUND));
+                    }
+
+                    List<Balance> existingBalances = userData.getBalance() != null
+                            ? new ArrayList<>(userData.getBalance())
+                            : new ArrayList<>();
+
+                    // Remove expired balances
+                    List<Balance> balanceList = removeExpiredBalances(existingBalances);
+
+                    // Check if serviceExpiry or bucketExpiryDate changed compared to cached balance
+                    boolean expiryChanged = false;
+                    for (Balance cachedBalance : balanceList) {
+                        if (cachedBalance.getServiceId().equals(serviceId)) {
+                            boolean serviceExpiryChanged = !Objects.equals(cachedBalance.getServiceExpiry(), balance.getServiceExpiry());
+                            boolean bucketExpiryChanged = !Objects.equals(cachedBalance.getBucketExpiryDate(), balance.getBucketExpiryDate());
+                            if (serviceExpiryChanged || bucketExpiryChanged) {
+                                LoggingUtil.logInfo(log, M_UPDATE,
+                                        "Expiry changed for user %s serviceId %s — serviceExpiry: %s -> %s, bucketExpiryDate: %s -> %s",
+                                        userName, serviceId,
+                                        cachedBalance.getServiceExpiry(), balance.getServiceExpiry(),
+                                        cachedBalance.getBucketExpiryDate(), balance.getBucketExpiryDate());
+                                expiryChanged = true;
+                            }
+                            break;
+                        }
+                    }
+
+                    balanceList.removeIf(b -> b.getServiceId().equals(serviceId));
+
+                    balanceList.add(balance);
+
+                    UserSessionData updatedUserData = userData.toBuilder()
+                            .balance(Collections.unmodifiableList(balanceList))
+                            .build();
+
+                    boolean finalExpiryChanged = expiryChanged;
+                    return cacheClient.updateUserAndRelatedCaches(userName, updatedUserData, userName)
+                            .call(() -> {
+                                if (finalExpiryChanged && userData.getSessions() != null && !userData.getSessions().isEmpty()) {
+                                    LoggingUtil.logInfo(log, M_UPDATE,
+                                            "Balance expiry changed for user %s serviceId %s, initiating COA Disconnect for %d active session(s)",
+                                            userName, serviceId, userData.getSessions().size());
+                                    return coaService.clearAllSessionsAndSendCOA(updatedUserData, userName, null, CoaDisconnectScenario.BALANCE_EXPIRY_CHANGED)
+                                            .replaceWithVoid();
+                                }
+                                return Uni.createFrom().voidItem();
+                            })
+                            .onItem().transform(result -> {
+                                LoggingUtil.logInfo(log, M_UPDATE, "Successfully updated balance for user %s, serviceId %s",
+                                        userName, serviceId);
+                                return createSuccessResponse(balance, "Updated balance Successfully");
+                            });
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_UPDATE, throwable, "Failed to update balance for user %s: %s",
+                            userName, throwable.getMessage());
+                    return createErrorResponse(
+                            "Failed to update balance: " + throwable.getMessage()
+                    );
+                });
+    }
+
+
+    private ApiResponse<Balance> createSuccessResponse(Balance balance,String massage) {
+        ApiResponse<Balance> response = new ApiResponse<>();
+        response.setTimestamp(Instant.now());
+        response.setMessage(massage);
+        response.setStatus(Response.Status.OK);
+        response.setData(balance);
+        return response;
+    }
+
+    private ApiResponse<Balance> createErrorResponse(String message) {
+        ApiResponse<Balance> response = new ApiResponse<>();
+        response.setTimestamp(Instant.now());
+        response.setMessage(message);
+        response.setData(null);
+        response.setStatus(Response.Status.BAD_REQUEST);
+        return response;
+    }
+
+
+    public Uni<ApiResponse<Balance>> terminateSessions(String userName,String sessionId) {
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        return Uni.createFrom().item(createErrorResponse(USER_NOT_FOUND));
+                    }
+                   return coaService.clearAllSessionsAndSendCOA(userData, userName, sessionId, CoaDisconnectScenario.MANUAL_TERMINATION)
+                           .onItem().transform(updatedUserData -> {
+                               LoggingUtil.logInfo(log, M_TERMINATE, "Sessions Terminated successfully for user %s, updated session count: %d",
+                                       userName, updatedUserData != null && updatedUserData.getSessions() != null ?
+                                       updatedUserData.getSessions().size() : 0);
+                               return createSuccessResponse(null,"Terminated successfully");
+                           });
+
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_TERMINATE, throwable, "Failed to send Disconnection COA for user %s: %s",
+                            userName, throwable.getMessage());
+                    return createErrorResponse(
+                            "Failed to send Disconnection COA: " + throwable.getMessage()
+                    );
+                });
+    }
+
+    /**
+     * Terminate sessions using HTTP-based CoA disconnect (non-blocking, no overhead).
+     * This method sends CoA disconnect via direct HTTP POST to NAS without Kafka overhead.
+     * After receiving ACK, sessions are cleared from cache automatically.
+     *
+     * @param userName the username
+     * @param sessionId specific session to disconnect (null for all sessions)
+     * @return ApiResponse with operation result
+     */
+    public Uni<ApiResponse<Balance>> terminateSessionsViaHttp(String userName, String sessionId) {
+        LoggingUtil.logInfo(log, M_TERMINATE, "Terminating sessions via HTTP for user %s, sessionId: %s", userName, sessionId);
+
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        return Uni.createFrom().item(createErrorResponse(USER_NOT_FOUND));
+                    }
+
+                    // Send HTTP CoA disconnect (non-blocking, cache cleared after ACK)
+                    return coaService.clearAllSessionsAndSendCOA(userData, userName, sessionId, CoaDisconnectScenario.MANUAL_TERMINATION)
+                            .onItem().transform(updatedUserData -> {
+                                LoggingUtil.logInfo(log, M_TERMINATE, "HTTP CoA disconnect sent successfully for user %s, updated session count: %d",
+                                        userName, updatedUserData != null && updatedUserData.getSessions() != null ?
+                                        updatedUserData.getSessions().size() : 0);
+                                return createSuccessResponse(null, "HTTP CoA disconnect sent successfully");
+                            });
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_TERMINATE, throwable, "Failed to send HTTP CoA disconnect for user %s: %s",
+                            userName, throwable.getMessage());
+                    return createErrorResponse(
+                            "Failed to send HTTP CoA disconnect: " + throwable.getMessage()
+                    );
+                });
+    }
+
+
+
+
+    public Uni<ApiResponse<String>> updateUserStatus(String userName, String status) {
+        LoggingUtil.logInfo(log, M_STATUS, "Updating user status for user %s to %s", userName, status);
+
+        // Input validation
+        if (userName == null || userName.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseString(USERNAME_IS_REQUIRED));
+        }
+        if (status == null || status.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseString("Status is required"));
+        }
+
+
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        return Uni.createFrom().item(createErrorResponseString(USER_NOT_FOUND));
+                    }
+
+                    String oldStatus = userData.getUserStatus();
+                    LoggingUtil.logInfo(log, M_STATUS, "Changing user status for user %s from %s to %s", userName, oldStatus, status);
+
+
+                    // Update userStatus in UserSessionData
+                    UserSessionData updatedUserData = userData.toBuilder()
+                            .userStatus(status)
+                            .build();
+
+                    // Update cache and send COA for any status update
+                    return cacheClient.updateUserAndRelatedCaches(userName, updatedUserData,userName)
+                            .call(() -> {
+                                // Send COA to notify NAS about status update for all active sessions
+                                if (userData.getSessions() != null && !userData.getSessions().isEmpty()) {
+                                    LoggingUtil.logInfo(log, M_STATUS, "User status changed from %s to %s, sending COA to update %d active sessions for user %s",
+                                            oldStatus, status, userData.getSessions().size(), userName);
+                                    return coaService.clearAllSessionsAndSendCOA(updatedUserData, userName, null, CoaDisconnectScenario.USER_STATUS_CHANGED)
+                                            .replaceWithVoid();
+                                }
+                                return Uni.createFrom().voidItem();
+                            })
+                            .onItem().transform(result -> {
+                                LoggingUtil.logInfo(log, M_STATUS, "Successfully updated user status for user %s to %s", userName, status);
+                                return createSuccessResponseString(
+                                        String.format("User status updated successfully from %s to %s", oldStatus, status)
+                                );
+                            });
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_STATUS, throwable, "Failed to update user status for user %s: %s",
+                            userName, throwable.getMessage());
+                    return createErrorResponseString(
+                            "Failed to update user status: " + throwable.getMessage()
+                    );
+                });
+    }
+
+    /**
+     * Update the serviceStatus of a specific balance (identified by serviceId) in cache,
+     * then send a COA request to all active sessions to notify NAS about the change.
+     *
+     * @param userName  the username
+     * @param serviceId the serviceId of the balance to update
+     * @param status    the new service status (e.g. "Active", "Barred", "Suspended")
+     * @return ApiResponse with operation result
+     */
+    public Uni<ApiResponse<String>> updateServiceStatus(String userName, String serviceId, String status) {
+        LoggingUtil.logInfo(log, M_SVC_STATUS, "Updating service status for user %s, serviceId %s to %s", userName, serviceId, status);
+
+        // Input validation
+        if (userName == null || userName.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseString(USERNAME_IS_REQUIRED));
+        }
+        if (serviceId == null || serviceId.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseString("Service ID is required"));
+        }
+        if (status == null || status.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseString("Status is required"));
+        }
+
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        return Uni.createFrom().item(createErrorResponseString(USER_NOT_FOUND));
+                    }
+
+                    List<Balance> existingBalances = userData.getBalance();
+                    if (existingBalances == null || existingBalances.isEmpty()) {
+                        return Uni.createFrom().item(createErrorResponseString("No balances found for user"));
+                    }
+
+                    // Find and update the balance with the matching serviceId
+                    boolean found = false;
+                    String oldStatus = null;
+                    List<Balance> updatedBalances = new ArrayList<>(existingBalances);
+                    for (Balance balance : updatedBalances) {
+                        if (serviceId.equals(balance.getServiceId())) {
+                            oldStatus = balance.getServiceStatus();
+                            balance.setServiceStatus(status);
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found) {
+                        return Uni.createFrom().item(createErrorResponseString(
+                                String.format("Balance with serviceId %s not found", serviceId)));
+                    }
+
+                    String previousStatus = oldStatus;
+                    LoggingUtil.logInfo(log, M_SVC_STATUS, "Changing service status for user %s, serviceId %s from %s to %s",
+                            userName, serviceId, previousStatus, status);
+
+                    UserSessionData updatedUserData = userData.toBuilder()
+                            .balance(Collections.unmodifiableList(updatedBalances))
+                            .build();
+
+                    // Update cache and then send COA for active sessions
+                    return cacheClient.updateUserAndRelatedCaches(userName, updatedUserData, userName)
+                            .call(() -> {
+                                // Send COA to notify NAS about service status change for all active sessions
+                                if (userData.getSessions() != null && !userData.getSessions().isEmpty()) {
+                                    LoggingUtil.logInfo(log, M_SVC_STATUS,
+                                            "Service status changed from %s to %s for serviceId %s, sending COA to update %d active sessions for user %s",
+                                            previousStatus, status, serviceId, userData.getSessions().size(), userName);
+                                    return coaService.clearAllSessionsAndSendCOA(updatedUserData, userName, null, CoaDisconnectScenario.SERVICE_STATUS_CHANGED)
+                                            .replaceWithVoid();
+                                }
+                                return Uni.createFrom().voidItem();
+                            })
+                            .onItem().transform(result -> {
+                                LoggingUtil.logInfo(log, M_SVC_STATUS, "Successfully updated service status for user %s, serviceId %s to %s",
+                                        userName, serviceId, status);
+                                return createSuccessResponseString(
+                                        String.format("Service status updated successfully from %s to %s for serviceId %s",
+                                                previousStatus, status, serviceId));
+                            });
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_SVC_STATUS, throwable, "Failed to update service status for user %s, serviceId %s: %s",
+                            userName, serviceId, throwable.getMessage());
+                    return createErrorResponseString(
+                            "Failed to update service status: " + throwable.getMessage());
+                });
+    }
+
+    /**
+     * Delete a specific service (balance) identified by serviceId from the user's cache,
+     * after sending CoA disconnect to all active sessions linked to that service.
+     *
+     * @param userName  the username
+     * @param serviceId the serviceId of the balance to delete
+     * @return ApiResponse with operation result
+     */
+    public Uni<ApiResponse<String>> deleteService(String userName, String serviceId) {
+        LoggingUtil.logInfo(log, M_DELETE_SVC, "Deleting service for user %s, serviceId %s", userName, serviceId);
+
+        // Input validation
+        if (userName == null || userName.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseString(USERNAME_IS_REQUIRED));
+        }
+        if (serviceId == null || serviceId.isBlank()) {
+            return Uni.createFrom().item(createErrorResponseString("Service ID is required"));
+        }
+
+        return cacheClient.getUserData(userName)
+                .onItem().transformToUni(userData -> {
+                    if (userData == null) {
+                        return Uni.createFrom().item(createErrorResponseString(USER_NOT_FOUND));
+                    }
+
+                    List<Balance> existingBalances = userData.getBalance();
+                    if (existingBalances == null || existingBalances.isEmpty()) {
+                        return Uni.createFrom().item(createErrorResponseString("No balances found for user"));
+                    }
+
+                    // Check if balance with the given serviceId exists
+                    boolean serviceExists = false;
+                    for (Balance b : existingBalances) {
+                        if (serviceId.equals(b.getServiceId())) {
+                            serviceExists = true;
+                            break;
+                        }
+                    }
+
+                    if (!serviceExists) {
+                        return Uni.createFrom().item(createErrorResponseString(
+                                String.format("Balance with serviceId %s not found", serviceId)));
+                    }
+
+                    // Remove the balance with the matching serviceId
+                    List<Balance> updatedBalances = new ArrayList<>(existingBalances);
+                    updatedBalances.removeIf(b -> serviceId.equals(b.getServiceId()));
+
+                    UserSessionData updatedUserData = userData.toBuilder()
+                            .balance(Collections.unmodifiableList(updatedBalances))
+                            .build();
+
+                    // Send CoA disconnect for active sessions associated with this serviceId, then update cache
+                    Uni<Void> coaUni;
+                    List<Session> sessions = userData.getSessions();
+                    if (sessions != null && !sessions.isEmpty()) {
+                        // Filter sessions linked to the serviceId being deleted
+                        List<Session> matchingSessions = new ArrayList<>();
+                        for (Session s : sessions) {
+                            if (serviceId.equals(s.getServiceId())) {
+                                matchingSessions.add(s);
+                            }
+                        }
+
+                        if (!matchingSessions.isEmpty()) {
+                            LoggingUtil.logInfo(log, M_DELETE_SVC,
+                                    "Sending CoA disconnect for %d sessions linked to serviceId %s for user %s",
+                                    matchingSessions.size(), serviceId, userName);
+                            coaUni = coaService.clearAllSessionsAndSendCOA(updatedUserData, userName, null, CoaDisconnectScenario.SERVICE_DELETED)
+                                    .replaceWithVoid();
+                        } else {
+                            coaUni = Uni.createFrom().voidItem();
+                        }
+                    } else {
+                        coaUni = Uni.createFrom().voidItem();
+                    }
+
+                    return cacheClient.updateUserAndRelatedCaches(userName, updatedUserData, userName)
+                            .call(() -> coaUni)
+                            .onItem().transform(result -> {
+                                LoggingUtil.logInfo(log, M_DELETE_SVC, "Successfully deleted service for user %s, serviceId %s", userName, serviceId);
+                                return createSuccessResponseString(
+                                        String.format("Service with serviceId %s deleted successfully", serviceId));
+                            });
+                })
+                .onFailure().recoverWithItem(throwable -> {
+                    LoggingUtil.logError(log, M_DELETE_SVC, throwable, "Failed to delete service for user %s, serviceId %s: %s",
+                            userName, serviceId, throwable.getMessage());
+                    return createErrorResponseString(
+                            "Failed to delete service: " + throwable.getMessage());
+                });
+    }
+
+    private ApiResponse<String> createSuccessResponseString(String message) {
+        ApiResponse<String> response = new ApiResponse<>();
+        response.setTimestamp(Instant.now());
+        response.setMessage(message);
+        response.setStatus(Response.Status.OK);
+        response.setData(null);
+        return response;
+    }
+
+    private ApiResponse<String> createErrorResponseString(String message) {
+        ApiResponse<String> response = new ApiResponse<>();
+        response.setTimestamp(Instant.now());
+        response.setMessage(message);
+        response.setData(null);
+        response.setStatus(Response.Status.BAD_REQUEST);
+        return response;
+    }
+}

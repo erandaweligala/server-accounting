@@ -1,0 +1,153 @@
+package com.csg.airtel.aaa4j.domain.service;
+
+import com.csg.airtel.aaa4j.application.common.LoggingUtil;
+import com.csg.airtel.aaa4j.domain.model.AccountingRequestDto;
+import com.csg.airtel.aaa4j.domain.model.session.Session;
+import com.csg.airtel.aaa4j.domain.model.session.UserSessionData;
+import com.csg.airtel.aaa4j.domain.produce.AccountProducer;
+import com.csg.airtel.aaa4j.external.clients.CacheClient;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.eclipse.microprofile.faulttolerance.exceptions.CircuitBreakerOpenException;
+import org.jboss.logging.Logger;
+
+import java.time.LocalDateTime;
+
+@ApplicationScoped
+public class InterimHandler {
+    private static final Logger log = Logger.getLogger(InterimHandler.class);
+    private static final String M_INTERIM = "handleInterim";
+    private static final String M_PROCESS = "processAccountingRequest";
+
+    private final AbstractAccountingHandler accountingHandler;
+    private final CacheClient cacheUtil;
+    private final AccountProducer accountProducer;
+
+    private final AccountingUtil accountingUtil;
+    private final SessionLifecycleManager sessionLifecycleManager;
+
+    @Inject
+    public InterimHandler(
+            AbstractAccountingHandler accountingHandler,
+            CacheClient cacheUtil,
+            AccountProducer accountProducer,
+            AccountingUtil accountingUtil,
+            SessionLifecycleManager sessionLifecycleManager) {
+        this.accountingHandler = accountingHandler;
+        this.cacheUtil = cacheUtil;
+        this.accountProducer = accountProducer;
+        this.accountingUtil = accountingUtil;
+        this.sessionLifecycleManager = sessionLifecycleManager;
+    }
+
+    public Uni<Void> handleInterim(AccountingRequestDto request,String traceId) {
+        return cacheUtil.getUserData(request.username())
+                .onItem().transformToUni(userSessionData ->
+                        userSessionData == null
+                                ? accountingHandler.handleNewSessionUsage(request, traceId, this::processAccountingRequest, this::createSession)
+                                : processAccountingRequest(userSessionData, request,null)
+                )
+                .onFailure().recoverWithUni(throwable -> {
+                    // Handle circuit breaker open specifically - cache service temporarily unavailable
+                    if (throwable instanceof CircuitBreakerOpenException) {
+                        LoggingUtil.logError(log, M_INTERIM, null, "Cache service circuit breaker is OPEN for user: %s. " +
+                                        "Service temporarily unavailable due to high tps or Redis connectivity issues.",
+                                request.username());
+                        return Uni.createFrom().voidItem();
+                    }
+                    // Handle other errors
+                    LoggingUtil.logError(log, M_INTERIM, throwable, "Error processing accounting for user: %s",
+                            request.username());
+                    return Uni.createFrom().voidItem();
+                });
+    }
+    private Uni<Void> processAccountingRequest(
+            UserSessionData userData, AccountingRequestDto request, String cachedGroupData) {
+        Session session = accountingHandler.findSessionById(userData.getSessions(), request.sessionId());
+        boolean isNewSession = session == null;
+
+        if (session == null) {
+            long concurrency = userData.getConcurrency();
+            String userStatus = userData.getUserStatus();
+            String sessionTimeout = userData.getSessionTimeOut();
+
+            if(cachedGroupData != null) {
+                int p1 = cachedGroupData.indexOf(',');
+                int p2 = cachedGroupData.indexOf(',', p1 + 1);
+                int p3 = cachedGroupData.indexOf(',', p2 + 1);
+
+                concurrency = parseLongFast(cachedGroupData, p1 + 1, p2);
+                userStatus = cachedGroupData.substring(p2 + 1, p3);
+                sessionTimeout = cachedGroupData.substring(p3 + 1);
+            }
+
+            session = createSession(request);
+            session.setGroupId(userData.getGroupId());
+            session.setAbsoluteTimeOut(sessionTimeout);
+            session.setUserConcurrency(concurrency);
+            session.setUserStatus(userStatus);
+        }
+
+        if("BARRED".equalsIgnoreCase(userData.getUserStatus())){
+            LoggingUtil.logWarn(log, M_PROCESS, "User status is BARRED for user: %s", request.username());
+            return generateAndSendCDR(request, session, session.getServiceId(), session.getPreviousUsageBucketId());
+        }
+        // Early return if session time hasn't increased
+        if (request.sessionTime() <= session.getSessionTime()) {
+            LoggingUtil.logWarn(log, M_PROCESS, "Duplicate Session time unchanged for sessionId: %s", request.sessionId());
+            return Uni.createFrom().voidItem();
+
+        } else {
+            Session finalSession = session;
+            return accountingUtil.updateSessionAndBalance(userData, session, request,null)
+                    .call(() -> isNewSession
+                            ? sessionLifecycleManager.onSessionCreated(request.username(), finalSession)
+                            : sessionLifecycleManager.onSessionActivity(request.username(), request.sessionId()))
+                    .onItem().transformToUni(updateResult -> {
+                        if (!updateResult.success()) {
+                            LoggingUtil.logWarn(log, M_PROCESS, "update failed for sessionId: %s reason: %s", request.sessionId(),updateResult.errorMessage());
+                        }
+                        Session updatedSessions  = updateResult.sessionData() != null ? updateResult.sessionData():finalSession;
+                        return generateAndSendCDR(request, updatedSessions, updatedSessions.getServiceId(), updatedSessions.getPreviousUsageBucketId());
+                    });
+        }
+    }
+
+    static long parseLongFast(String s, int start, int end) {
+        long val = 0;
+        for (int i = start; i < end; i++) {
+            val = val * 10 + (s.charAt(i) - '0');
+        }
+        return val;
+    }
+
+
+    private Session createSession(AccountingRequestDto request) {
+        return new Session(
+                request.sessionId(),
+                LocalDateTime.now(),
+                LocalDateTime.now(),
+                null,
+                request.sessionTime() - 1,
+                0L,
+                request.framedIPAddress(),
+                request.nasIP(),
+                request.nasPortId(),
+                0,
+                0,null,
+                request.username(),null,null,
+                null,
+                0
+
+        );
+    }
+
+
+    private Uni<Void> generateAndSendCDR(AccountingRequestDto request, Session session, String serviceId, String bucketId) {
+        return CdrMappingUtil.generateAndSendCDR(request, session, accountProducer, CdrMappingUtil::buildInterimCDREvent, serviceId, bucketId);
+    }
+
+
+
+}
