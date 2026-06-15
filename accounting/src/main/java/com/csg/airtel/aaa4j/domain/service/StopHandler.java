@@ -75,6 +75,8 @@ public class StopHandler {
 
         Session finalSession = session;
         return cleanSessionAndUpdateBalance(userSessionData,bucketId,request,session)
+                .onFailure().invoke(throwable ->
+                        LoggingUtil.logError(log, M_PROCESS, throwable, "Balance update failed for session: %s", request.sessionId()))
                 .onFailure().recoverWithNull()
                 .onItem().transformToUni(updateResult -> {
                     if(updateResult != null && updateResult.success()) {

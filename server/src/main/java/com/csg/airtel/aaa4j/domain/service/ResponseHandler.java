@@ -202,7 +202,7 @@ public class ResponseHandler {
                     "Added UserName attribute: %s", username);
         }
 
-        String nasIP = params.get("nasIP");
+        String nasIP = params.get("nasip");
         if (nasIP != null && !nasIP.trim().isEmpty()) {
             parseIpAddress(nasIP).ifPresent(ip -> {
                 attributes.add(new NasIpAddress(new Ipv4AddrData(ip)));
@@ -211,7 +211,7 @@ public class ResponseHandler {
             });
         }
 
-        String framedIP = params.get("framedIP");
+        String framedIP = params.get("framedip");
         if (framedIP != null && !framedIP.trim().isEmpty()) {
             parseIpAddress(framedIP).ifPresent(ip -> {
                 attributes.add(new FramedIpAddress(new Ipv4AddrData(ip)));
@@ -220,7 +220,7 @@ public class ResponseHandler {
             });
         }
 
-        String sessionId = params.get("sessionId");
+        String sessionId = params.get("sessionid");
         if (sessionId != null && !sessionId.trim().isEmpty()) {
             attributes.add(new AcctSessionId(new TextData(sessionId)));
             LoggingUtil.logDebug(log, CLASS_NAME, BUILD_ATTRIBUTES,
@@ -228,7 +228,7 @@ public class ResponseHandler {
         }
 
         params.forEach((key, value) -> {
-            if (!key.equals("username") && !key.equals("nasIP") && !key.equals("framedIP") && !key.equals("sessionId")) {
+            if (!key.equals("username") && !key.equals("nasip") && !key.equals("framedip") && !key.equals("sessionid")) {
                 LoggingUtil.logDebug(log, CLASS_NAME, BUILD_ATTRIBUTES,
                         "Unknown QoS parameter: %s = %s", key, value);
             }
