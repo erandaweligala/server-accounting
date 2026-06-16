@@ -11,6 +11,7 @@ import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 
@@ -33,6 +34,13 @@ public class RedisResource {
 
     final NotificationTrackingService notificationTrackingService;
 
+    /**
+     * These /debug endpoints expose and mutate cache/accounting state with no authentication.
+     * They are disabled by default; set debug.endpoints.enabled=true (non-production only) to use them.
+     */
+    @ConfigProperty(name = "debug.endpoints.enabled", defaultValue = "false")
+    boolean debugEnabled;
+
     public RedisResource(UserBucketRepository userRepository, CacheClient cacheClient, AccountingHandlerFactory accountingHandlerFactory, NotificationTrackingService notificationTrackingService) {
         this.userRepository = userRepository;
         this.cacheClient = cacheClient;
@@ -40,11 +48,25 @@ public class RedisResource {
         this.notificationTrackingService = notificationTrackingService;
     }
 
+    /** Reject access to debug endpoints unless explicitly enabled via config. Returns 404 to avoid disclosing existence. */
+    private void assertDebugEnabled() {
+        if (!debugEnabled) {
+            throw new NotFoundException();
+        }
+    }
+
+    private static String requireNonBlank(String value, String paramName) {
+        if (value == null || value.isBlank()) {
+            throw new BadRequestException(paramName + " is required");
+        }
+        return value;
+    }
+
     @GET
     @Path("/redis-ping")
     @Produces(MediaType.TEXT_PLAIN)
     public Uni<Map<String, Object>> testConnection() {
-
+        assertDebugEnabled();
         return userRepository.getServiceBucketsByUserName("100001")
                 .onItem().transform(buckets -> {
                     Map<String, Object> results = new HashMap<>();
@@ -59,7 +81,7 @@ public class RedisResource {
     @Produces(MediaType.TEXT_PLAIN)
     @Consumes(MediaType.APPLICATION_JSON)
     public Uni<Map<String, Object>> interimUpdate(AccountingRequestDto request) {
-
+        assertDebugEnabled();
         return accountingHandlerFactory
                 .getHandler(request,null)
                 .onItem().transform(result -> {
@@ -74,7 +96,8 @@ public class RedisResource {
     @Path("/redis/delete")
     @Produces(MediaType.APPLICATION_JSON)
     public Uni<Map<String, Object>> deleteKeyCache(@QueryParam("username") String key) {
-
+        assertDebugEnabled();
+        requireNonBlank(key, "username");
         return cacheClient
                 .deleteKey(key)
                 .onItem().transform(result -> {
@@ -89,6 +112,8 @@ public class RedisResource {
     @Produces(MediaType.APPLICATION_JSON)
     @Consumes(MediaType.APPLICATION_JSON)
     public Uni <UserSessionData> getKeyCache(@QueryParam("username") String key) {
+        assertDebugEnabled();
+        requireNonBlank(key, "username");
         log.infof("cache check request initiated key %s",key);
         return cacheClient
                 .getUserData(key)
@@ -103,7 +128,8 @@ public class RedisResource {
     @Consumes(MediaType.APPLICATION_JSON)
     public Uni<Map<String, Object>> deleteNotification(@QueryParam("username") String username,@QueryParam("templateId") long templateId,
                                                    @QueryParam("bucketId") String bucketId, @QueryParam("thresholdLevel") long thresholdLevel) {
-
+        assertDebugEnabled();
+        requireNonBlank(username, "username");
         return notificationTrackingService
                 .clearNotificationTracking(username,templateId,bucketId,thresholdLevel)
                 .onItem().transform(result -> {

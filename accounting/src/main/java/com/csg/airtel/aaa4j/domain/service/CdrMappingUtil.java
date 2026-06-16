@@ -156,7 +156,7 @@ public class CdrMappingUtil {
             String eventType) {
 
         String sessionTimeStr = sessionTime != null ? String.valueOf(sessionTime) : "0";
-        Instant eventEndTime = Objects.equals(eventType, "Stop") ? request.timestamp() : null;
+        Instant eventEndTime = Objects.equals(eventType, EventTypes.ACCOUNTING_STOP.name()) ? request.timestamp() : null;
 
         return SessionCdr.builder()
                 .sessionId(request.sessionId())

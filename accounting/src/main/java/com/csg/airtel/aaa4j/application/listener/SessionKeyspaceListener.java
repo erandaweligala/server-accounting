@@ -13,6 +13,8 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
+
 /**
  * Listens for Redis keyspace expiry notifications to implement event-driven
  * absolute session timeout.
@@ -65,12 +67,16 @@ public class SessionKeyspaceListener {
     private void subscribeToExpiredEvents() {
         ReactivePubSubCommands<String> pubSub = reactiveRedisDataSource.pubsub(String.class);
 
+        // Retry the subscription with capped backoff so a Redis outage at startup (or a
+        // dropped connection that fails the subscribe) does not permanently disable
+        // absolute-timeout handling.
         pubSub.subscribe(EXPIRED_CHANNEL, this::handleExpiredKey)
+                .onFailure().retry().withBackOff(Duration.ofSeconds(2), Duration.ofSeconds(30)).atMost(10)
                 .subscribe().with(
                         v -> LoggingUtil.logInfo(log, M_LISTEN,
                                 "Subscribed to Redis keyspace channel: %s", EXPIRED_CHANNEL),
                         e -> LoggingUtil.logError(log, M_LISTEN, e,
-                                "Failed to subscribe to Redis keyspace channel: %s", EXPIRED_CHANNEL)
+                                "Failed to subscribe to Redis keyspace channel after retries: %s", EXPIRED_CHANNEL)
                 );
     }
 

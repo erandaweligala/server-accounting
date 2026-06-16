@@ -79,7 +79,7 @@ public class RadiusServerConfiguration {
 
         // Summary
         if (!errors.isEmpty()) {
-            logger.warn("RADIUS servers started with {} error(s)");
+            logger.warnf("RADIUS servers started with %d error(s)", errors.size());
         } else {
             logger.info("All enabled RADIUS servers started successfully");
         }
@@ -87,15 +87,15 @@ public class RadiusServerConfiguration {
 
     private void logConfiguration() {
         logger.infof("RADIUS Configuration:");
-        logger.infof("  Auth Server    : enabled={}, port={}, bind={}",
+        logger.infof("  Auth Server    : enabled=%s, port=%d, bind=%s",
                 config.auth().enabled(), config.auth().port(), config.auth().bindAddress());
-        logger.infof("  Accounting     : enabled={}, port={}, bind={}",
+        logger.infof("  Accounting     : enabled=%s, port=%d, bind=%s",
                 config.accounting().enabled(), config.accounting().port(), config.accounting().bindAddress());
-        logger.infof("  Fail on Error  : {}", config.failOnStartupError());
+        logger.infof("  Fail on Error  : %s", config.failOnStartupError());
 
         int bngCount = bngRegistry.getBngCount();
         if (bngCount > 0) {
-            logger.infof("  Multi-BNG mode enabled with {} configured BNG(s)", bngCount);
+            logger.infof("  Multi-BNG mode enabled with %d configured BNG(s)", bngCount);
         } else {
             logger.infof("  Single shared secret mode (no per-BNG configuration)");
         }

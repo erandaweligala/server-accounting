@@ -271,12 +271,7 @@ public class AccountProducer {
     @Timeout(value = 10000)
     @Fallback(fallbackMethod = "fallbackProduceQuotaNotificationEvent")
     public Uni<Void> produceQuotaNotificationEvent(ThresholdExpiryEvent event) {
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debugf("Start produce Quota Notification Event for user: %s, threshold: %s",
-                    event.data().serviceLineNumber(), event.meta().eventType());
-        }
-        /*
+        long startTime = System.currentTimeMillis();
         return Uni.createFrom().emitter(em -> {
             Message<ThresholdExpiryEvent> message = Message.of(event)
                     .addMetadata(OutgoingKafkaRecordMetadata.<String>builder()
@@ -284,8 +279,10 @@ public class AccountProducer {
                             .build())
                     .withAck(() -> {
                         em.complete(null);
-                        LOG.infof("Successfully sent quota notification event for user: %s, %d ms",
-                                event.data().serviceLineNumber(), System.currentTimeMillis() - startTime);
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debugf("Sent quota notification event for user=%s in %d ms",
+                                    event.data().serviceLineNumber(), System.currentTimeMillis() - startTime);
+                        }
                         return CompletableFuture.completedFuture(null);
                     })
                     .withNack(throwable -> {
@@ -296,9 +293,6 @@ public class AccountProducer {
 
             quotaNotificationEmitter.send(message);
         });
-
-         */
-        return Uni.createFrom().voidItem();
     }
 
     /**

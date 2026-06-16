@@ -188,7 +188,7 @@ public class RadiusAuthenticationHandler implements RadiusServer.Handler {
                 .orElse(null);
 
         LoggingUtil.logDebug(logger, CLASS_NAME, "handleAccessRequest",
-                "Authentication request for user: %s, password: %s, nasIpAddress: %s", username, password, nasIpAddress);
+                "Authentication request for user: %s, nasIpAddress: %s", username, nasIpAddress);
         return authenticateUser(username, password, chapChallenge, chapPassword, nasIpAddress, framedProtocol);
     }
 

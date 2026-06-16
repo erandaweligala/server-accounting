@@ -96,9 +96,16 @@ public class AbsoluteSessionTerminatorService {
         LoggingUtil.logInfo(log, M_TERMINATE,
                 "Removing absolute timeout session %s for user %s", sessionId, userId);
 
-        // Send CoA disconnect via HTTP; fall back to original userData if CoA itself fails
+        // Send CoA disconnect via HTTP. If CoA itself fails, still remove the timed-out
+        // session from the cached userData so it is not left behind untracked (its TTL
+        // index entry is removed below regardless of CoA outcome).
         return coaService.clearAllSessionsAndSendCOA(userData, userId, sessionId, CoaDisconnectScenario.ABSOLUTE_SESSION_TIMEOUT)
-                .onFailure().recoverWithItem(userData)
+                .onFailure().recoverWithItem(() -> {
+                    LoggingUtil.logWarn(log, M_TERMINATE,
+                            "CoA disconnect failed for session %s (user %s); removing session from cache anyway",
+                            sessionId, userId);
+                    return removeSessionLocally(userData, sessionId);
+                })
                 .onItem().transformToUni(updatedUserData -> {
 
                     // DB write + index removal + cache update – execute in parallel
@@ -113,6 +120,19 @@ public class AbsoluteSessionTerminatorService {
                                     LoggingUtil.logError(log, M_TERMINATE, e,
                                             "Error during cleanup for userId=%s sessionId=%s", userId, sessionId));
                 });
+    }
+
+    /**
+     * Returns a copy of {@code userData} with the given session removed. Used to force-remove a
+     * timed-out session from the cache when the CoA disconnect could not be delivered.
+     */
+    private UserSessionData removeSessionLocally(UserSessionData userData, String sessionId) {
+        List<Session> remaining = userData.getSessions() == null
+                ? List.of()
+                : userData.getSessions().stream()
+                        .filter(s -> !sessionId.equals(s.getSessionId()))
+                        .toList();
+        return userData.toBuilder().sessions(remaining).build();
     }
 
     private Session findSession(List<Session> sessions, String sessionId) {
